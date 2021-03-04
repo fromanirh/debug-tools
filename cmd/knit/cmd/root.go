@@ -21,6 +21,8 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
@@ -32,8 +34,9 @@ type knitOptions struct {
 	procFSRoot string
 	sysFSRoot  string
 
-	debug bool
-	log   *log.Logger
+	jsonOutput bool
+	debug      bool
+	log        *log.Logger
 }
 
 // NewRootCommand returns entrypoint command to interact with all other commands
@@ -45,7 +48,12 @@ func NewRootCommand() *cobra.Command {
 
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			var err error
-			knitOpts.cpus, err = cpuset.Parse(knitOpts.cpuList)
+			cpuList, err := getCpuList(knitOpts)
+			if err != nil {
+				return fmt.Errorf("cannot detect the cpu list: %v", err)
+			}
+
+			knitOpts.cpus, err = cpuset.Parse(cpuList)
 			if err != nil {
 				return fmt.Errorf("error parsing %q: %v", knitOpts.cpuList, err)
 			}
@@ -65,16 +73,35 @@ func NewRootCommand() *cobra.Command {
 	}
 
 	// see https://man7.org/linux/man-pages/man7/cpuset.7.html#FORMATS for more details
-	root.PersistentFlags().StringVarP(&knitOpts.cpuList, "cpulist", "C", "0-16383", "isolated cpu set to check (see man (7) cpuset - List format")
+	root.PersistentFlags().StringVarP(&knitOpts.cpuList, "cpulist", "C", "", "cpu set to check (see man (7) cpuset - List format - empty means use all online cpus")
 	root.PersistentFlags().StringVarP(&knitOpts.procFSRoot, "procfs", "P", "/proc", "procfs root")
 	root.PersistentFlags().StringVarP(&knitOpts.sysFSRoot, "sysfs", "S", "/sys", "sysfs root")
 	root.PersistentFlags().BoolVarP(&knitOpts.debug, "debug", "D", false, "enable debug log")
+	root.PersistentFlags().BoolVarP(&knitOpts.jsonOutput, "json", "J", false, "output as JSON")
 
 	root.AddCommand(
 		newCPUAffinityCommand(knitOpts),
 		newIRQAffinityCommand(knitOpts),
+		newIRQWatchCommand(knitOpts),
 	)
 
 	return root
+}
 
+func getCpuList(knitOpts *knitOptions) (string, error) {
+	if knitOpts == nil {
+		return "", fmt.Errorf("nil knitOpts") // can't happen
+	}
+	if knitOpts.cpuList != "" {
+		return knitOpts.cpuList, nil
+	}
+	return getCpuListFromSysfs(knitOpts.sysFSRoot)
+}
+
+func getCpuListFromSysfs(sysfsRoot string) (string, error) {
+	data, err := ioutil.ReadFile(filepath.Join(sysfsRoot, "devices", "system", "cpu", "online"))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }

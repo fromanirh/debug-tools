@@ -17,7 +17,9 @@
 package irqs
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"path/filepath"
 	"sort"
@@ -32,6 +34,49 @@ import (
 const (
 	EffectiveAffinity = 1 << iota
 )
+
+// the IRQ name is not always a number, can be like "NMI", "TLB"...
+type Counter map[string]uint64
+
+// assume x is fresher than x. IRQ (all stems by how the kernel does the accounting):
+// if a irq is counted in both c and x, then val(x) >= val(x)
+// x is always a superset of c
+func (C Counter) Delta(X Counter) Counter {
+	R := make(Counter)
+	for name, amount := range X {
+		if delta := amount - C[name]; delta > 0 {
+			R[name] = delta
+		}
+	}
+	return R
+}
+
+func (C Counter) Clone() Counter {
+	R := make(Counter)
+	for k, v := range C {
+		R[k] = v
+	}
+	return R
+}
+
+// CPUid -> counter
+type Stats map[int]Counter
+
+func (S Stats) Delta(X Stats) Stats {
+	R := make(Stats)
+	for cpuid, counter := range X {
+		R[cpuid] = S[cpuid].Delta(counter)
+	}
+	return R
+}
+
+func (S Stats) Clone() Stats {
+	R := make(Stats)
+	for k, v := range S {
+		R[k] = v.Clone()
+	}
+	return R
+}
 
 type Info struct {
 	Source string
@@ -101,6 +146,60 @@ func (handler *Handler) ReadInfo(flags uint) ([]Info, error) {
 		})
 	}
 	return irqInfos, nil
+}
+
+func (handler *Handler) ReadStats() (Stats, error) {
+	src, err := handler.fs.Open(filepath.Join(handler.procfsRoot, "interrupts"))
+	if err != nil {
+		return nil, fmt.Errorf("error reading interrupts from %q: %v", handler.procfsRoot, err)
+	}
+	defer src.Close()
+	return parseInterrupts(handler.log, src)
+}
+
+func parseInterrupts(logger *log.Logger, rd io.Reader) (Stats, error) {
+	src := bufio.NewScanner(rd)
+	src.Scan()
+	cpus := strings.Fields(src.Text())
+
+	// do NOT assume columnid == cpuid (what if we have offlined cpus?)
+	col2cpu := make(map[int]int)
+
+	stats := make(Stats)
+	for colid, cpu := range cpus {
+		var cpuid int
+		n, err := fmt.Sscanf(cpu, "CPU%d", &cpuid)
+		if n != 1 || err != nil {
+			return nil, fmt.Errorf("cannot parse cpu name %q: err=%v", cpu, err)
+		}
+		stats[cpuid] = make(Counter)
+		col2cpu[colid] = cpuid
+	}
+
+	// format:
+	// IRQ: cpu0_counter ... cpuN_counter [stuff we dont care]
+	// so we need to scan only the first len(cpus) + 1 columns
+	maxCols := 1 + len(cpus)
+	for src.Scan() {
+		items := strings.Fields(src.Text())
+		if len(items) < maxCols {
+			// irq name == MIS
+			continue
+		}
+		irqName := strings.TrimSuffix(items[0], ":")
+		for colid, item := range items[1:maxCols] {
+			count, err := strconv.ParseUint(item, 10, 64)
+			if err != nil {
+				log.Printf("Error parsing interrupts info from %q: %v", item, err)
+				continue
+			}
+
+			// column 0 is always the IRQ name
+			cpuid := col2cpu[colid-1]
+			stats[cpuid][irqName] = count
+		}
+	}
+	return stats, nil
 }
 
 // TODO: we may want to crosscorrelate with `/proc/interrupts, which always give a valid (!= "") source
