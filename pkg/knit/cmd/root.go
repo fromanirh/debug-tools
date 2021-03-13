@@ -57,7 +57,7 @@ func NewRootCommand() *cobra.Command {
 			}
 
 			if knitOpts.Debug {
-				knitOpts.Log = log.New(os.Stderr, "knit", log.LstdFlags)
+				knitOpts.Log = log.New(os.Stderr, "knit ", log.LstdFlags)
 			} else {
 				knitOpts.Log = log.New(ioutil.Discard, "", 0)
 			}
